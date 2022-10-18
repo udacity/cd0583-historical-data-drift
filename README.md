@@ -1,6 +1,6 @@
 # Historical Data Drift
 
-In this tutorial, we will calculate and visualize historical data drift, which tells us how data has changed.
+In this tutorial, we will calculate and visualize historical data drift, which tells us how data has changed. We have used the [UCI Bike Sharing dataset](https://archive.ics.uci.edu/ml/datasets/bike+sharing+dataset) for this tutorial.
 
 ### Steps to run
 1. Clone this repository.
