@@ -1,4 +1,4 @@
-plotly==5.10.0
-evidently==0.1.58.dev0
-mlflow==1.29.0
-kaleido==0.2.1
+plotly==5.24.1
+evidently==0.7.21
+mlflow==3.8.1
+kaleido==1.2.0
