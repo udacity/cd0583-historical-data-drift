@@ -1,253 +1,333 @@
-import plotly.offline as py  # working offline
-from mlflow.tracking import MlflowClient
-import mlflow.sklearn
-import mlflow
-from evidently.model_profile.sections import DataDriftProfileSection
-from evidently.model_profile import Profile
-from evidently.pipeline.column_mapping import ColumnMapping
-import plotly.graph_objs as go
+from pathlib import Path
 import io
-import zipfile
-import requests
-import numpy as np
-import pandas as pd
-import json
 import warnings
-warnings.filterwarnings('ignore')
-warnings.simplefilter('ignore')
+import zipfile
 
+import mlflow
+import pandas as pd
+import plotly.graph_objects as go
+import requests
 
-content = requests.get(
-    "https://archive.ics.uci.edu/ml/machine-learning-databases/00275/Bike-Sharing-Dataset.zip").content
-with zipfile.ZipFile(io.BytesIO(content)) as arc:
-    raw_data = pd.read_csv(arc.open("day.csv"), 
-                            header=0, 
-                            sep=',', 
-                            parse_dates=['dteday'], 
-                            index_col='dteday')
+from evidently import DataDefinition, Dataset, Report
+from evidently.metrics import DriftedColumnsCount, ValueDrift
 
-# set column mapping for Evidently Profile
-data_columns = ColumnMapping()
-data_columns.numerical_features = [
-    'weathersit', 'temp', 'atemp', 'hum', 'windspeed']
+warnings.filterwarnings("ignore")
 
-# set reference dates
-reference_dates = ('2011-01-01 00:00:00', '2011-01-28 23:00:00')
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "images"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-# set experiment batches dates
-experiment_batches = [
-    ('2011-02-01 00:00:00', '2011-02-28 23:00:00'),
-    ('2011-03-01 00:00:00', '2011-03-31 23:00:00'),
-    ('2011-04-01 00:00:00', '2011-04-30 23:00:00'),
-    ('2011-05-01 00:00:00', '2011-05-31 23:00:00'),
-    ('2011-06-01 00:00:00', '2011-06-30 23:00:00'),
-    ('2011-07-01 00:00:00', '2011-07-31 23:00:00'),
+DATA_URL = (
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/"
+    "00275/Bike-Sharing-Dataset.zip"
+)
+
+EXPERIMENT_NAME = "Dataset Drift Analysis with Evidently"
+
+NUMERICAL_FEATURES = ["weathersit", "temp", "atemp", "hum", "windspeed"]
+
+REFERENCE_START = "2011-01-01 00:00:00"
+REFERENCE_END = "2011-01-28 23:00:00"
+
+EXPERIMENT_BATCHES = [
+    ("2011-02-01 00:00:00", "2011-02-28 23:00:00"),
+    ("2011-03-01 00:00:00", "2011-03-31 23:00:00"),
+    ("2011-04-01 00:00:00", "2011-04-30 23:00:00"),
+    ("2011-05-01 00:00:00", "2011-05-31 23:00:00"),
+    ("2011-06-01 00:00:00", "2011-06-30 23:00:00"),
+    ("2011-07-01 00:00:00", "2011-07-31 23:00:00"),
 ]
 
-# evaluate data drift with Evidently Profile
+
+def setup_mlflow() -> None:
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_experiment(EXPERIMENT_NAME)
 
 
-def detect_dataset_drift(reference, production, column_mapping, get_ratio=False):
-    """
-    Returns True if Data Drift is detected, else returns False.
-    If get_ratio is True, returns ration of drifted features.
-    The Data Drift detection depends on the confidence level and the threshold.
-    For each individual feature Data Drift is detected with the selected confidence (default value is 0.95).
-    Data Drift for the dataset is detected if share of the drifted features is above the selected threshold (default value is 0.5).
-    """
+def load_data() -> pd.DataFrame:
+    response = requests.get(DATA_URL, timeout=60)
+    response.raise_for_status()
 
-    data_drift_profile = Profile(sections=[DataDriftProfileSection()])
-    data_drift_profile.calculate(
-        reference, production, column_mapping=column_mapping)
-    report = data_drift_profile.json()
-    json_report = json.loads(report)
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        df = pd.read_csv(
+            archive.open("day.csv"),
+            header=0,
+            sep=",",
+            parse_dates=["dteday"],
+            index_col="dteday",
+        )
 
-    n_features = json_report["data_drift"]["data"]["metrics"]["n_features"]
-    n_drifted_features = json_report["data_drift"]["data"]["metrics"]["n_drifted_features"]
-
-    if get_ratio:
-        return n_drifted_features / n_features
-    else:
-        return json_report["data_drift"]["data"]["metrics"]["dataset_drift"]
+    return df
 
 
-# evaluate data drift with Evidently Profile
-def detect_features_drift(reference, production, column_mapping, get_scores=False):
-    """
-    Returns 1 if Data Drift is detected, else returns 0. 
-    If get_scores is True, returns scores value (like p-value) for each feature.
-    The Data Drift detection depends on the confidence level and the threshold.
-    For each individual feature Data Drift is detected with the selected confidence (default value is 0.95).
-    """
+def make_dataset(df: pd.DataFrame) -> Dataset:
+    definition = DataDefinition(numerical_columns=NUMERICAL_FEATURES)
+    return Dataset.from_pandas(
+        df[NUMERICAL_FEATURES].copy(),
+        data_definition=definition,
+    )
 
-    data_drift_profile = Profile(sections=[DataDriftProfileSection()])
-    data_drift_profile.calculate(
-        reference, production, column_mapping=column_mapping)
-    report = data_drift_profile.json()
-    json_report = json.loads(report)
 
-    drifts = []
-    num_features = column_mapping.numerical_features if column_mapping.numerical_features else []
-    cat_features = column_mapping.categorical_features if column_mapping.categorical_features else []
-    for feature in num_features + cat_features:
-        drift_score = json_report['data_drift']['data']['metrics'][feature]['drift_score']
-        if get_scores:
-            drifts.append((feature, drift_score))
+def first_match(obj, keys):
+    if isinstance(obj, dict):
+        for key in keys:
+            if key in obj:
+                return obj[key]
+        for value in obj.values():
+            found = first_match(value, keys)
+            if found is not None:
+                return found
+
+    if isinstance(obj, list):
+        for item in obj:
+            found = first_match(item, keys)
+            if found is not None:
+                return found
+
+    return None
+
+
+def run_report(metric, current_df: pd.DataFrame, reference_df: pd.DataFrame) -> dict:
+    current_dataset = make_dataset(current_df)
+    reference_dataset = make_dataset(reference_df)
+
+    report = Report([metric])
+    result = report.run(current_dataset, reference_dataset)
+    return result.dict()
+
+
+def detect_dataset_drift(
+    reference_df: pd.DataFrame,
+    production_df: pd.DataFrame,
+    return_ratio: bool = False,
+):
+    report_dict = run_report(
+        DriftedColumnsCount(),
+        current_df=production_df,
+        reference_df=reference_df,
+    )
+
+    drift_count = first_match(report_dict, ["count", "drifted_columns_count"])
+    drift_share = first_match(report_dict, ["share", "drift_share"])
+
+    if drift_share is None and drift_count is not None:
+        drift_share = drift_count / len(NUMERICAL_FEATURES)
+
+    if drift_share is None:
+        raise ValueError("Could not extract dataset drift results from Evidently output.")
+
+    if return_ratio:
+        return float(drift_share)
+
+    return bool(drift_share >= 0.5)
+
+
+def detect_features_drift(
+    reference_df: pd.DataFrame,
+    production_df: pd.DataFrame,
+    return_scores: bool = False,
+):
+    results = []
+
+    for feature in NUMERICAL_FEATURES:
+        report_dict = run_report(
+            ValueDrift(column=feature),
+            current_df=production_df,
+            reference_df=reference_df,
+        )
+
+        drift_detected = first_match(report_dict, ["drift_detected", "detected"])
+        drift_score = first_match(report_dict, ["drift_score", "score", "value"])
+
+        if drift_detected is None and drift_score is None:
+            raise ValueError(
+                f"Could not extract drift results for feature '{feature}'."
+            )
+
+        if return_scores:
+            results.append((feature, float(drift_score)))
         else:
-            drifts.append(
-                (feature, json_report['data_drift']['data']['metrics'][feature]['drift_detected']))
+            results.append((feature, bool(drift_detected)))
 
-    return drifts
+    return results
 
 
-features_historical_drift = []
+def log_batch_to_mlflow(
+    batch_label: str,
+    dataset_drift: bool,
+    dataset_drift_ratio: float,
+    feature_flags: list[tuple[str, bool]],
+    feature_scores: list[tuple[str, float]],
+) -> None:
+    with mlflow.start_run(run_name=batch_label):
+        mlflow.log_param("batch", batch_label)
+        mlflow.log_param("experiment_type", "historical_data_drift")
 
-for date in experiment_batches:
-    drifts = detect_features_drift(raw_data.loc[reference_dates[0]:reference_dates[1]],
-                                raw_data.loc[date[0]:date[1]],
-                                column_mapping=data_columns)
+        mlflow.log_metric("dataset_drift", int(dataset_drift))
+        mlflow.log_metric("dataset_drift_ratio", float(dataset_drift_ratio))
 
-    features_historical_drift.append([x[1] for x in drifts])
+        for feature, flag in feature_flags:
+            mlflow.log_metric(f"{feature}_drift_flag", int(flag))
 
-features_historical_drift_frame = pd.DataFrame(features_historical_drift,
-                                            columns=data_columns.numerical_features)
+        for feature, score in feature_scores:
+            mlflow.log_metric(f"{feature}_drift_score", float(score))
 
-fig = go.Figure(data=go.Heatmap(
-    z=features_historical_drift_frame.astype(int).transpose(),
-    x=[x[1] for x in experiment_batches],
-    y=data_columns.numerical_features,
-    hoverongaps=False,
-    xgap=1,
-    ygap=1,
-    zmin=0,
-    zmax=1,
-    showscale=False,
-    colorscale='Bluered'
-))
 
-fig.update_xaxes(side="top")
+def save_figure(fig: go.Figure, stem: str) -> None:
+    html_path = OUTPUT_DIR / f"{stem}.html"
+    fig.write_html(str(html_path))
 
-fig.update_layout(
-    xaxis_title="Timestamp",
-    yaxis_title="Feature Drift"
-)
-fig.write_image("images/fig1.png")
+    png_path = OUTPUT_DIR / f"{stem}.png"
+    try:
+        fig.write_image(str(png_path))
+        print(f"Saved: {html_path.name}, {png_path.name}")
+    except Exception as exc:
+        print(f"Saved: {html_path.name}")
+        print(f"PNG export skipped for {stem}: {exc}")
 
-features_historical_drift_pvalues = []
 
-for date in experiment_batches:
-    drifts = detect_features_drift(raw_data.loc[reference_dates[0]:reference_dates[1]],
-                                raw_data.loc[date[0]:date[1]],
-                                column_mapping=data_columns,
-                                get_scores=True)
-
-    features_historical_drift_pvalues.append([x[1] for x in drifts])
-
-features_historical_drift_pvalues_frame = pd.DataFrame(features_historical_drift_pvalues,
-                                                    columns=data_columns.numerical_features)
-
-fig = go.Figure(data=go.Heatmap(
-    z=features_historical_drift_pvalues_frame.transpose(),
-    x=[x[1] for x in experiment_batches],
-    y=features_historical_drift_pvalues_frame.columns,
-    hoverongaps=False,
-    xgap=1,
-    ygap=1,
-    zmin=0,
-    zmax=1,
-    colorscale='reds_r'
-)
-)
-
-fig.update_xaxes(side="top")
-
-fig.update_layout(
-    xaxis_title="Timestamp",
-    yaxis_title="p-value"
-)
-fig.write_image("images/fig2.png")
-dataset_historical_drift = []
-
-for date in experiment_batches:
-    dataset_historical_drift.append(detect_dataset_drift(raw_data.loc[reference_dates[0]:reference_dates[1]],
-                                                        raw_data.loc[date[0]:date[1]],
-                                                        column_mapping=data_columns))
-
-fig = go.Figure(data=go.Heatmap(
-    z=[[1 if x == True else 0 for x in dataset_historical_drift]],
-    x=[x[1] for x in experiment_batches],
-    y=[''],
-    hoverongaps=False,
-    xgap=1,
-    ygap=1,
-    zmin=0,
-    zmax=1,
-    colorscale='Bluered',
-    showscale=False
+def make_heatmap(
+    z,
+    x_labels,
+    y_labels,
+    title_x: str,
+    title_y: str,
+    colorscale: str,
+    zmin=None,
+    zmax=None,
+    showscale=True,
+) -> go.Figure:
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=x_labels,
+            y=y_labels,
+            hoverongaps=False,
+            xgap=1,
+            ygap=1,
+            zmin=zmin,
+            zmax=zmax,
+            showscale=showscale,
+            colorscale=colorscale,
+        )
     )
-)
 
-fig.update_xaxes(side="top")
-
-fig.update_layout(
-    xaxis_title="Timestamp",
-    yaxis_title="Dataset Drift"
-)
-fig.write_image("images/fig3.png")
-
-dataset_historical_drift_ratio = []
-
-for date in experiment_batches:
-    dataset_historical_drift_ratio.append(detect_dataset_drift(raw_data.loc[reference_dates[0]:reference_dates[1]],
-                                                            raw_data.loc[date[0]                                                                            :date[1]],
-                                                            column_mapping=data_columns,
-                                                            get_ratio=True))
-
-
-fig = go.Figure(data=go.Heatmap(
-    z=[dataset_historical_drift_ratio],
-    x=[x[1] for x in experiment_batches],
-    y=[''],
-    hoverongaps=False,
-    xgap=1,
-    ygap=1,
-    zmin=0.5,
-    zmax=1,
-    colorscale='reds'
+    fig.update_xaxes(side="top")
+    fig.update_layout(
+        xaxis_title=title_x,
+        yaxis_title=title_y,
+        template="plotly_white",
     )
-)
+    return fig
 
-fig.update_xaxes(side="top")
 
-fig.update_layout(
-    xaxis_title="Timestamp",
-    yaxis_title="Dataset Drift"
-)
-fig.write_image("images/fig4.png")
+def main() -> None:
+    setup_mlflow()
 
-# log into MLflow
-client = MlflowClient()
+    raw_data = load_data()
+    reference_df = raw_data.loc[REFERENCE_START:REFERENCE_END].copy()
+    x_labels = [end for _, end in EXPERIMENT_BATCHES]
 
-# set experiment
-mlflow.set_experiment('Dataset Drift Analysis with Evidently')
+    feature_drift_flags_matrix = []
+    feature_drift_scores_matrix = []
+    dataset_drift_flags = []
+    dataset_drift_ratios = []
 
-# start new run
-for date in experiment_batches:
-    with mlflow.start_run() as run:
+    for start, end in EXPERIMENT_BATCHES:
+        production_df = raw_data.loc[start:end].copy()
+        batch_label = f"{start} to {end}"
 
-        # Log parameters
-        mlflow.log_param("begin", date[0])
-        mlflow.log_param("end", date[1])
+        feature_flags = detect_features_drift(reference_df, production_df)
+        feature_scores = detect_features_drift(
+            reference_df,
+            production_df,
+            return_scores=True,
+        )
+        dataset_drift = detect_dataset_drift(reference_df, production_df)
+        dataset_drift_ratio = detect_dataset_drift(
+            reference_df,
+            production_df,
+            return_ratio=True,
+        )
 
-        # Log metrics
-        metric = detect_dataset_drift(raw_data.loc[reference_dates[0]:reference_dates[1]],
-                                    raw_data.loc[date[0]:date[1]],
-                                    column_mapping=data_columns,
-                                    get_ratio=True)
+        feature_drift_flags_matrix.append([int(flag) for _, flag in feature_flags])
+        feature_drift_scores_matrix.append([score for _, score in feature_scores])
+        dataset_drift_flags.append(int(dataset_drift))
+        dataset_drift_ratios.append(dataset_drift_ratio)
 
-        mlflow.log_metric('dataset drift', metric)
-        # auto logging
-        mlflow.autolog()
-        autolog_run = mlflow.last_active_run()
+        log_batch_to_mlflow(
+            batch_label=batch_label,
+            dataset_drift=dataset_drift,
+            dataset_drift_ratio=dataset_drift_ratio,
+            feature_flags=feature_flags,
+            feature_scores=feature_scores,
+        )
 
-        print(run.info)
+    feature_drift_flags_df = pd.DataFrame(
+        feature_drift_flags_matrix,
+        columns=NUMERICAL_FEATURES,
+    )
+
+    fig1 = make_heatmap(
+        z=feature_drift_flags_df.transpose().values,
+        x_labels=x_labels,
+        y_labels=NUMERICAL_FEATURES,
+        title_x="Timestamp",
+        title_y="Feature Drift",
+        colorscale="Bluered",
+        zmin=0,
+        zmax=1,
+        showscale=False,
+    )
+    save_figure(fig1, "fig1")
+
+    feature_drift_scores_df = pd.DataFrame(
+        feature_drift_scores_matrix,
+        columns=NUMERICAL_FEATURES,
+    )
+
+    fig2 = make_heatmap(
+        z=feature_drift_scores_df.transpose().values,
+        x_labels=x_labels,
+        y_labels=NUMERICAL_FEATURES,
+        title_x="Timestamp",
+        title_y="Drift Score",
+        colorscale="Reds",
+        zmin=0,
+        zmax=1,
+        showscale=True,
+    )
+    save_figure(fig2, "fig2")
+
+    fig3 = make_heatmap(
+        z=[dataset_drift_flags],
+        x_labels=x_labels,
+        y_labels=[""],
+        title_x="Timestamp",
+        title_y="Dataset Drift",
+        colorscale="Bluered",
+        zmin=0,
+        zmax=1,
+        showscale=False,
+    )
+    save_figure(fig3, "fig3")
+
+    fig4 = make_heatmap(
+        z=[dataset_drift_ratios],
+        x_labels=x_labels,
+        y_labels=[""],
+        title_x="Timestamp",
+        title_y="Drift Ratio",
+        colorscale="Reds",
+        zmin=0,
+        zmax=1,
+        showscale=True,
+    )
+    save_figure(fig4, "fig4")
+
+    print(f"\nSaved outputs to: {OUTPUT_DIR}")
+    print(f"MLflow experiment: {EXPERIMENT_NAME}")
+
+
+if __name__ == "__main__":
+    main()
